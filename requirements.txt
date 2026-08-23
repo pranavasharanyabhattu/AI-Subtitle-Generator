@@ -1,0 +1,4 @@
+Flask
+Werkzeug
+deep-translator
+openai-whisper
