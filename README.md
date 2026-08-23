@@ -50,7 +50,8 @@ Visit `http://127.0.0.1:5000` in your browser.
 ## Note
 - Whisper's `tiny` model is used for speed; swap to `base`/`small`/`medium` in `app.py` for better accuracy at the cost of speed
 - Uploaded videos and generated subtitle files are stored locally in `uploads/` and `outputs/` (not committed to git)
-
+- Transcription runs on CPU by default, so processing can take a few minutes depending on video length — this is expected, not a bug. For faster testing, try a short clip (under 30 seconds).
+  
 ## Possible improvements
 - Progress indicator during transcription (currently just a loading animation)
 - Support for multiple concurrent users (currently single global video state)
