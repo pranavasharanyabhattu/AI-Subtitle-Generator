@@ -239,16 +239,15 @@ def upload():
         start = segment['start']
         end   = segment['end']
         text  = segment['text'].strip()
- 
-        # translate each segment to the desired language
+     
         translated_text = translate_text(text, language_code)
  
-        # SRT
+        
         srt_content += f"{i+1}\n"
         srt_content += f"{format_time(start)} --> {format_time(end)}\n"
         srt_content += f"{translated_text}\n\n"
  
-        # WebVTT
+        
         vtt_content += f"{format_time(start).replace(',', '.')} --> {format_time(end).replace(',', '.')}\n"
         vtt_content += f"{translated_text}\n\n"
  
