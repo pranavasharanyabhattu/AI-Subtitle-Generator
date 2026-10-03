@@ -7,6 +7,7 @@
 body{
 
     min-height:100vh;
+    min-height:100dvh;
 
     display:flex;
 
@@ -21,7 +22,7 @@ body{
     #111111,
     #1a1a1a);
 
-    overflow:hidden;
+    overflow-x:hidden;
 
     font-family:Arial, sans-serif;
 
@@ -101,7 +102,7 @@ h1{
 
     color:#f81f1f;
 
-    font-size:clamp(2.1rem,5vw,2.1rem);
+    font-size:clamp(1.75rem,8vw,2.1rem);
 
     margin-bottom:35px;
 

@@ -1,21 +1,42 @@
-from flask import Flask, render_template, request, send_file
-from werkzeug.utils import secure_filename
-from deep_translator import GoogleTranslator
-import whisper
 import os
+import re
+import glob
+import time
+import uuid
+import shutil
+import threading
 import subprocess
- 
+
+from flask import (
+    Flask,
+    jsonify,
+    render_template,
+    render_template_string,
+    request,
+    send_file,
+)
+from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator.constants import MY_MEMORY_LANGUAGES_TO_CODES
+import whisper
+
 app = Flask(__name__)
- 
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB upload limit
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 OUTPUT_FOLDER = os.path.join(BASE_DIR, "outputs")
- 
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
- 
-model = whisper.load_model("tiny")
- 
+
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+LANG_CODE_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z]{2,4})?$")
+JOB_MAX_AGE_SECONDS = 24 * 60 * 60  # old jobs are deleted after 24 hours
+
+model = None
+transcribe_lock = threading.Lock()  # one transcription at a time on the shared model
+
 LANGUAGE_MAP = {
     # A
     "Afrikaans":            "af",
@@ -150,223 +171,418 @@ LANGUAGE_MAP = {
     # Z
     "Zulu":                 "zu",
 }
- 
-current_video_filename = None
- 
- 
+
+
 def format_time(seconds):
-    h  = int(seconds // 3600)
-    m  = int((seconds % 3600) // 60)
-    s  = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
+    total_ms = int(round(seconds * 1000))
+    h, rest = divmod(total_ms, 3_600_000)
+    m, rest = divmod(rest, 60_000)
+    s, ms = divmod(rest, 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
- 
- 
-def translate_text(text, target_language_code):
+
+
+def base_language(code):
+    base = code.split("-")[0].lower()
+    return "he" if base == "iw" else base
+
+
+def mymemory_language_code(code, allow_auto=False):
+    if allow_auto and (not code or code.lower() == "auto"):
+        return "auto"
+
+    normalized = base_language(code).lower()
+    aliases = {"jw": "jv", "in": "id", "no": "nb"}
+    normalized = aliases.get(normalized, normalized)
+    supported_codes = list(MY_MEMORY_LANGUAGES_TO_CODES.values())
+    if code in supported_codes:
+        return code
+    for supported_code in supported_codes:
+        if supported_code.split("-")[0].lower() == normalized:
+            return supported_code
+    if allow_auto:
+        return "auto"
+    raise ValueError(f"MyMemory does not support language code {code!r}")
+
+
+def translate_segments(texts, target_language_code, source_language_code="auto", max_batch_chars=4000):
+    """Translate subtitle lines in compact Google requests with a MyMemory fallback."""
+    marker = "ZXQSUBTITLEBREAKZXQ"
+    translated_texts = list(texts)
+    failed = 0
+    chunks = []
+    fallback_indexes = []
+    current_chunk = []
+    current_size = 0
+
+    for index, text in enumerate(texts):
+        text = text.strip()
+        extra_size = len(text) + (len(marker) if current_chunk else 0)
+        if current_chunk and current_size + extra_size > max_batch_chars:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_size = 0
+            extra_size = len(text)
+        current_chunk.append((index, text))
+        current_size += extra_size
+    if current_chunk:
+        chunks.append(current_chunk)
+
     try:
-        translated = GoogleTranslator(
-            source="auto",
-            target=target_language_code
-        ).translate(text)
-        return translated if translated else text
-    except Exception:
-        # if translation fails, return original text
-        return text
- 
- 
-@app.route('/')
+        translator = GoogleTranslator(source="auto", target=target_language_code)
+    except Exception as e:
+        app.logger.warning("Could not initialize translator: %s", e)
+        return translated_texts, len(texts)
+    for chunk_number, chunk in enumerate(chunks):
+        if chunk_number:
+            time.sleep(1.1)
+        indexes, lines = zip(*chunk)
+        try:
+            payload = f"\n{marker}\n".join(lines)
+            result = translator.translate(payload)
+            parts = result.split(marker) if result else []
+            if len(parts) != len(lines):
+                raise ValueError("The translation response did not preserve subtitle boundaries")
+            for index, translated in zip(indexes, parts):
+                translated_texts[index] = translated.strip()
+        except Exception as e:
+            app.logger.warning("Translation batch failed: %s", e)
+            fallback_indexes.extend(indexes)
+
+    if fallback_indexes:
+        try:
+            fallback_translator = MyMemoryTranslator(
+                source=mymemory_language_code(source_language_code, allow_auto=True),
+                target=mymemory_language_code(target_language_code),
+                email=os.environ.get("MYMEMORY_EMAIL"),
+            )
+        except Exception as e:
+            app.logger.warning("Could not initialize MyMemory fallback: %s", e)
+            fallback_translator = None
+
+        for position, index in enumerate(fallback_indexes):
+            original = texts[index].strip()
+            if position:
+                time.sleep(0.3)
+            try:
+                if len(original.encode("utf-8")) > 500:
+                    raise ValueError("MyMemory accepts at most 500 bytes per subtitle line")
+                result = fallback_translator.translate(original) if fallback_translator else None
+                if result:
+                    translated_texts[index] = result
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                app.logger.warning("MyMemory fallback failed for subtitle line %d: %s", index + 1, e)
+
+    return translated_texts, failed
+
+
+def error_response(message, status):
+    return jsonify({"error": message}), status
+
+
+def job_paths(job_id):
+    job_dir = os.path.join(OUTPUT_FOLDER, job_id)
+    return {
+        "dir": job_dir,
+        "audio": os.path.join(job_dir, "audio.wav"),
+        "srt": os.path.join(job_dir, "subtitles.srt"),
+        "vtt": os.path.join(job_dir, "subtitles.vtt"),
+        "lang": os.path.join(job_dir, "lang.txt"),
+    }
+
+
+def find_video(job_id):
+    matches = glob.glob(os.path.join(UPLOAD_FOLDER, job_id + ".*"))
+    return matches[0] if matches else None
+
+
+def discard_job(job_id):
+    shutil.rmtree(os.path.join(OUTPUT_FOLDER, job_id), ignore_errors=True)
+    for path in glob.glob(os.path.join(UPLOAD_FOLDER, job_id + ".*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def cleanup_old_jobs():
+    cutoff = time.time() - JOB_MAX_AGE_SECONDS
+    try:
+        for name in os.listdir(OUTPUT_FOLDER):
+            path = os.path.join(OUTPUT_FOLDER, name)
+            if JOB_ID_RE.match(name) and os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                discard_job(name)
+    except OSError as e:
+        app.logger.warning("Cleanup failed: %s", e)
+
+
+def valid_job_or_404(job_id):
+    if not JOB_ID_RE.match(job_id):
+        return None
+    paths = job_paths(job_id)
+    return paths if os.path.isdir(paths["dir"]) else None
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    return error_response("File is too large (maximum 500 MB).", 413)
+
+
+@app.route("/")
 def home():
-    return render_template('index.html')
- 
- 
-@app.route('/upload', methods=['POST'])
+    return render_template("index.html")
+
+
+@app.route("/upload", methods=["POST"])
 def upload():
-    global current_video_filename
- 
-    if 'video' not in request.files:
-        return "No video uploaded", 400
- 
-    video = request.files['video']
- 
-    if video.filename == "":
-        return "No file selected", 400
- 
-    filename = secure_filename(video.filename)
-    current_video_filename = filename
- 
-    video_path = os.path.join(UPLOAD_FOLDER, filename)
-    video.save(video_path)
- 
-    audio_path = os.path.join(OUTPUT_FOLDER, "audio.wav")
- 
+    video = request.files.get("video")
+    if video is None:
+        return error_response("No video uploaded.", 400)
+    if not video.filename:
+        return error_response("No file selected.", 400)
+
+    ext = os.path.splitext(video.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        return error_response(f"Unsupported file type. Please upload one of: {allowed}", 400)
+
+    language_name = request.form.get("language", "English")
+    language_code = LANGUAGE_MAP.get(language_name, "en")
+
+    cleanup_old_jobs()
+
+    job_id = uuid.uuid4().hex
+    paths = job_paths(job_id)
+    os.makedirs(paths["dir"])
+    video_path = os.path.join(UPLOAD_FOLDER, job_id + ext)
+
+    try:
+        video.save(video_path)
+        return run_job(job_id, video_path, paths, language_code)
+    except Exception:
+        app.logger.exception("Unexpected error while processing job %s", job_id)
+        discard_job(job_id)
+        return error_response("Something went wrong on the server. Please try again.", 500)
+
+
+def run_job(job_id, video_path, paths, language_code):
     command = [
         "ffmpeg", "-y",
         "-i", video_path,
+        "-vn",
         "-ar", "16000",
         "-ac", "1",
-        audio_path
+        paths["audio"],
     ]
- 
-    result_ffmpeg = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
- 
-    if result_ffmpeg.returncode != 0 or not os.path.exists(audio_path):
-        error_msg = result_ffmpeg.stderr.decode("utf-8", errors="ignore")
-        return f"Audio extraction failed: {error_msg}", 500
- 
-    language_name = request.form.get("language", "English")
-    language_code = LANGUAGE_MAP.get(language_name, "en")
- 
     try:
-        # always transcribe first in original spoken language
-        result = model.transcribe(audio_path)
- 
-    except Exception as e:
-        return f"Transcription error: {str(e)}", 500
- 
-    segments = result["segments"]
- 
-    if len(segments) == 0:
-        return "No speech detected in video", 400
- 
-    srt_content = ""
-    vtt_content = "WEBVTT\n\n"
- 
-    for i, segment in enumerate(segments):
-        start = segment['start']
-        end   = segment['end']
-        text  = segment['text'].strip()
- 
-        # translate each segment to the desired language
-        translated_text = translate_text(text, language_code)
- 
-        # SRT
-        srt_content += f"{i+1}\n"
-        srt_content += f"{format_time(start)} --> {format_time(end)}\n"
-        srt_content += f"{translated_text}\n\n"
- 
-        # WebVTT
-        vtt_content += f"{format_time(start).replace(',', '.')} --> {format_time(end).replace(',', '.')}\n"
-        vtt_content += f"{translated_text}\n\n"
- 
-    srt_path = os.path.join(OUTPUT_FOLDER, "subtitles.srt")
-    vtt_path = os.path.join(OUTPUT_FOLDER, "subtitles.vtt")
- 
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
- 
-    with open(vtt_path, "w", encoding="utf-8") as f:
-        f.write(vtt_content)
- 
-    if os.path.getsize(srt_path) == 0:
-        return "Subtitle file is empty", 500
- 
-    return "success", 200
- 
- 
-@app.route('/download')
-def download():
-    srt_path = os.path.join(OUTPUT_FOLDER, "subtitles.srt")
- 
-    if not os.path.exists(srt_path):
-        return "No subtitles found. Please generate them first.", 404
- 
-    return send_file(srt_path, as_attachment=True)
- 
- 
-@app.route('/video/<filename>')
-def serve_video(filename):
-    filename = secure_filename(filename)
-    video_path = os.path.join(UPLOAD_FOLDER, filename)
- 
-    if not os.path.exists(video_path):
-        return "Video not found", 404
- 
+        proc = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600
+        )
+    except FileNotFoundError:
+        discard_job(job_id)
+        return error_response("ffmpeg is not installed on the server.", 500)
+    except subprocess.TimeoutExpired:
+        discard_job(job_id)
+        return error_response("Audio extraction took too long. Try a shorter video.", 400)
+
+    if proc.returncode != 0 or not os.path.exists(paths["audio"]):
+        app.logger.warning(
+            "ffmpeg failed for job %s: %s",
+            job_id,
+            proc.stderr.decode("utf-8", errors="ignore")[-500:],
+        )
+        discard_job(job_id)
+        return error_response(
+            "Could not read audio from this file. Make sure it is a valid video that has an audio track.",
+            400,
+        )
+
+    try:
+        with transcribe_lock:
+            global model
+            if model is None:
+                model = whisper.load_model(os.environ.get("WHISPER_MODEL", "tiny"))
+            result = model.transcribe(paths["audio"], fp16=False)
+    except Exception:
+        app.logger.exception("Transcription failed for job %s", job_id)
+        discard_job(job_id)
+        return error_response("Transcription failed. Please try again with a different file.", 500)
+    finally:
+        try:
+            os.remove(paths["audio"])  # the wav is large and no longer needed
+        except OSError:
+            pass
+
+    segments = result.get("segments", [])
+    if not segments:
+        discard_job(job_id)
+        return error_response("No speech detected in video.", 400)
+
+    detected_language = result.get("language", "")
+
+    target_base = base_language(language_code)
+    needs_translation = not (target_base == detected_language and target_base != "zh")
+
+    texts = [segment["text"].strip() for segment in segments]
+    failed = 0
+    if needs_translation:
+        texts, failed = translate_segments(
+            texts, language_code, source_language_code=detected_language or "auto"
+        )
+
+    warnings = []
+    if failed:
+        if needs_translation and failed == len(segments):
+            warnings.append(
+                "Translation is unavailable. Subtitles were created in the original "
+                f"language ({detected_language or 'unknown'}). Check your internet "
+                "connection and try again to translate them."
+            )
+        else:
+            warnings.append(
+                f"{failed} of {len(segments)} subtitle lines could not be translated "
+                f"and were left in the original language ({detected_language or 'unknown'})."
+            )
+
+    srt_blocks = []
+    vtt_blocks = ["WEBVTT\n"]
+    for i, (segment, text) in enumerate(zip(segments, texts), start=1):
+        start = format_time(segment["start"])
+        end = format_time(segment["end"])
+        srt_blocks.append(f"{i}\n{start} --> {end}\n{text}\n")
+        vtt_blocks.append(f"{start.replace(',', '.')} --> {end.replace(',', '.')}\n{text}\n")
+
+    with open(paths["srt"], "w", encoding="utf-8") as f:
+        f.write("\n".join(srt_blocks))
+    with open(paths["vtt"], "w", encoding="utf-8") as f:
+        f.write("\n".join(vtt_blocks))
+    with open(paths["lang"], "w", encoding="utf-8") as f:
+        f.write(language_code)
+
+    return jsonify(
+        {
+            "job_id": job_id,
+            "language": language_code,
+            "detected_language": detected_language,
+            "translated": needs_translation,
+            "warnings": warnings,
+        }
+    )
+
+
+@app.route("/download/<job_id>")
+def download(job_id):
+    paths = valid_job_or_404(job_id)
+    if paths is None or not os.path.exists(paths["srt"]):
+        return error_response("No subtitles found. Please generate them first.", 404)
+    return send_file(paths["srt"], as_attachment=True, download_name="subtitles.srt")
+
+
+@app.route("/video/<job_id>")
+def serve_video(job_id):
+    if valid_job_or_404(job_id) is None:
+        return error_response("Video not found.", 404)
+    video_path = find_video(job_id)
+    if not video_path:
+        return error_response("Video not found.", 404)
     return send_file(video_path)
- 
- 
-@app.route('/subtitles.vtt')
-def serve_vtt():
-    vtt_path = os.path.join(OUTPUT_FOLDER, "subtitles.vtt")
- 
-    if not os.path.exists(vtt_path):
-        return "Subtitles not found", 404
- 
-    return send_file(vtt_path, mimetype="text/vtt")
- 
- 
-@app.route('/watch')
-def watch():
-    if not current_video_filename:
-        return "No video available. Please upload and generate subtitles first.", 404
- 
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Watch Video</title>
-        <style>
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{
-                background: #0a0a0a;
-                color: white;
-                font-family: 'Courier New', monospace;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                min-height: 100vh;
-                padding: 40px 20px;
-            }}
-            h1 {{
-                color: #ff7300;
-                margin-bottom: 24px;
-                font-size: 1.6rem;
-            }}
-            video {{
-                width: 100%;
-                max-width: 860px;
-                border-radius: 16px;
-                border: 2px solid #ff7300;
-                box-shadow: 0 0 30px rgba(255,115,0,0.3);
-            }}
-            a {{
-                margin-top: 24px;
-                color: #ff7300;
-                border: 2px solid #ff7300;
-                padding: 10px 22px;
-                border-radius: 10px;
-                text-decoration: none;
-                transition: 0.3s;
-            }}
-            a:hover {{
-                background: #ff7300;
-                color: black;
-            }}
-        </style>
-    </head>
-    <body>
-        <h1>Watch Video 👻</h1>
-        <video controls>
-            <source src="/video/{current_video_filename}">
-            <track
-                kind="subtitles"
-                src="/subtitles.vtt"
-                srclang="en"
-                label="Subtitles"
-                default
-            >
-            Your browser does not support the video tag.
-        </video>
-        <a href="/">← Back to Generator</a>
-    </body>
-    </html>
-    """
- 
- 
-if __name__ == '__main__':
-    app.run(debug=True)
- 
+
+
+@app.route("/subtitles/<job_id>.vtt")
+def serve_vtt(job_id):
+    paths = valid_job_or_404(job_id)
+    if paths is None or not os.path.exists(paths["vtt"]):
+        return error_response("Subtitles not found.", 404)
+    return send_file(paths["vtt"], mimetype="text/vtt")
+
+
+WATCH_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Watch Video</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0a0a;
+            color: white;
+            font-family: 'Courier New', monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        h1 {
+            color: #ff7300;
+            margin-bottom: 24px;
+            font-size: 1.6rem;
+        }
+        video {
+            width: 100%;
+            max-width: 860px;
+            border-radius: 16px;
+            border: 2px solid #ff7300;
+            box-shadow: 0 0 30px rgba(255,115,0,0.3);
+        }
+        a {
+            margin-top: 24px;
+            color: #ff7300;
+            border: 2px solid #ff7300;
+            padding: 10px 22px;
+            border-radius: 10px;
+            text-decoration: none;
+            transition: 0.3s;
+        }
+        a:hover {
+            background: #ff7300;
+            color: black;
+        }
+    </style>
+</head>
+<body>
+    <h1>Watch Video 👻</h1>
+    <video controls>
+        <source src="/video/{{ job_id }}">
+        <track
+            kind="subtitles"
+            src="/subtitles/{{ job_id }}.vtt"
+            srclang="{{ lang }}"
+            label="Subtitles"
+            default
+        >
+        Your browser does not support the video tag.
+    </video>
+    <a href="/">← Back to Generator</a>
+</body>
+</html>
+"""
+
+
+@app.route("/watch/<job_id>")
+def watch(job_id):
+    paths = valid_job_or_404(job_id)
+    if paths is None or not find_video(job_id) or not os.path.exists(paths["vtt"]):
+        return error_response(
+            "No video available. Please upload and generate subtitles first.", 404
+        )
+
+    lang = "en"
+    try:
+        with open(paths["lang"], encoding="utf-8") as f:
+            candidate = f.read().strip()
+        if LANG_CODE_RE.match(candidate):
+            lang = candidate
+    except OSError:
+        pass
+
+    return render_template_string(WATCH_TEMPLATE, job_id=job_id, lang=lang)
+
+
+if __name__ == "__main__":
+    app.run(debug=os.environ.get("FLASK_DEBUG") == "1")
