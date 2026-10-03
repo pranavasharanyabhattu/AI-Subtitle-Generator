@@ -205,7 +205,6 @@ def mymemory_language_code(code, allow_auto=False):
 
 
 def translate_segments(texts, target_language_code, source_language_code="auto", max_batch_chars=4000):
-    """Translate subtitle lines in compact Google requests with a MyMemory fallback."""
     marker = "ZXQSUBTITLEBREAKZXQ"
     translated_texts = list(texts)
     failed = 0
@@ -243,7 +242,7 @@ def translate_segments(texts, target_language_code, source_language_code="auto",
             if len(parts) != len(lines):
                 raise ValueError("The translation response did not preserve subtitle boundaries")
             for index, translated in zip(indexes, parts):
-                translated_texts[index] = translated.strip()
+                translated_texts[index] = translated.strip() or texts[index].strip()
         except Exception as e:
             app.logger.warning("Translation batch failed: %s", e)
             fallback_indexes.extend(indexes)
@@ -259,20 +258,31 @@ def translate_segments(texts, target_language_code, source_language_code="auto",
             app.logger.warning("Could not initialize MyMemory fallback: %s", e)
             fallback_translator = None
 
+        consecutive_failures = 0
+        quota_used_up = False
         for position, index in enumerate(fallback_indexes):
             original = texts[index].strip()
+            if quota_used_up or consecutive_failures >= 5:
+                failed += 1  # MyMemory is out of quota or down: don't keep hammering it
+                continue
             if position:
                 time.sleep(0.3)
             try:
                 if len(original.encode("utf-8")) > 500:
                     raise ValueError("MyMemory accepts at most 500 bytes per subtitle line")
                 result = fallback_translator.translate(original) if fallback_translator else None
+                if result and "MYMEMORY WARNING" in result.upper():
+                    quota_used_up = True  # it returns this text as if it were the translation
+                    raise ValueError("MyMemory free quota used up")
                 if result:
                     translated_texts[index] = result
+                    consecutive_failures = 0
                 else:
                     failed += 1
+                    consecutive_failures += 1
             except Exception as e:
                 failed += 1
+                consecutive_failures += 1
                 app.logger.warning("MyMemory fallback failed for subtitle line %d: %s", index + 1, e)
 
     return translated_texts, failed
